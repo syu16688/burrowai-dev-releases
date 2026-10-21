@@ -1,5 +1,8 @@
 {
-  "keys": {},
+  "keys": {
+    "burrow-release-2026b": "739fdc866c8579b996fca8077f632f93cf5edb59b1d6a75d548c1bd48d463320",
+    "burrow-release-2026c": "d1169539ac716ea76da57c35a02c8ca02cf21fe12eaf4fd8aa7e0c8d1f53ce04"
+  },
   "product": "burrowai-dev",
-  "signed_since": null
+  "signed_since": "0.1.182"
 }
