@@ -4,50 +4,66 @@ v<version>) in the PUBLIC release-only repo syu16688/burrowai-dev-releases —
 the independent copy the worker's first-start cross-check
 (burrowai_dev.release_trust) and Sam's daily diff compare burrowai.dev
 against (DESIGN_e2e_encryption.md §3.3 v6, step 3). Standard library + git +
-the `gh` CLI.
+the `gh` CLI. This one file is also the mirror's PUBLISHER: a copy lives on
+the mirror's protected main as .github/mirror/github_release.py.
 
 Assets, byte-identical to what goes to burrowai.dev:
   latest.json, latest.json.sig (signed releases), the worker wheel, every
   `dep` wheel the manifest lists, and release-keys.json (the key table the
   WHEEL pins + its fingerprint; generated here from the wheel itself).
 
-How a release reaches the mirror (one path for CI and promote_release.sh;
-no personal access token anywhere):
+Who controls what (Codex r12 P1): the uploader supplies DATA only, never
+code. Whoever holds the write deploy key (CI's MIRROR_DEPLOY_KEY) can push
+tags, but the code that runs with the mirror's `contents: write` token comes
+only from the mirror's main, which a repository ruleset (burrow-mirror-main)
+makes unwritable by the deploy key, by Actions and by anyone without
+changing the ruleset:
 
-  1. `push VERSION DIR --phase draft` (CI with the write deploy key
-     MIRROR_DEPLOY_KEY over ssh; Sam's machine with his own git login) —
-     refuses if a PUBLISHED v<version> already serves different bytes, then
-     makes ONE commit on top of the mirror's main holding assets/<files>,
-     .github/mirror/github_release.py (this file) and
-     .github/workflows/publish.yml (scripts/mirror/publish.yml), and
-     force-pushes it as tag v<version>. The commit is reachable only through
-     its tag: main never contains release files (no history bloat; unchanged
-     dep wheels are the same git blobs release after release).
-  2. The mirror's publish.yml (on: push tags v*, its own GITHUB_TOKEN with
-     contents: write) runs `workflow v<version> assets` → `draft`: creates
-     (or completes) the DRAFT release from the files in the tag. A draft's
-     differing assets are replaced (re-runs rebuild non-reproducible
-     wheels); a PUBLISHED release with different bytes is a hard refusal.
-     `push` waits for that run and fails if it fails.
+  1. `push VERSION DIR --phase draft` (CI with the deploy key over ssh;
+     Sam's machine with his own git login) refuses if a PUBLISHED
+     v<version> already serves different bytes, then pushes ONE root commit
+     holding nothing but assets/<files> as tag v<version> (data; no
+     workflow, no script).
+  2. The mirror's publish.yml runs on `schedule` (every 5 min) and
+     `workflow_dispatch` only — both always use the workflow on the default
+     branch; there is no push trigger. It clones main and runs `scan`, which
+     lists the tags v<semver> / publish/v<semver> (anything else is
+     ignored), reads ONLY the assets/* blobs of each new tag commit as data,
+     verifies them (`verify_release`: wheel/dep sha256 against latest.json,
+     release-keys.json against the wheel, and — once the key table on main,
+     keys/release-keys.json, has keys — latest.json.sig against THAT table;
+     an unsigned release for a version >= the table's `signed_since` is
+     refused) and drafts (v<ver>) or publishes (publish/v<ver>) the release.
+     It reports the outcome as commit status `burrow-mirror/publish` on the
+     tag's commit; `push` waits for that status and fails if it isn't
+     success.
   3. After latest.json is live on burrowai.dev: `push VERSION DIR --phase
-     publish` pushes the same files as tag publish/v<version>; the mirror
-     runs `finalize` (re-download every draft asset, require identical
-     bytes, then publish). `push` waits for it, then re-downloads every
-     asset from the PUBLIC URL workers use and requires identical bytes.
+     publish` pushes the same files as tag publish/v<version>; the scan
+     re-verifies, re-downloads every draft asset, requires identical bytes
+     and publishes. `push` then re-downloads every asset from the PUBLIC URL
+     workers use and requires identical bytes.
 
-Every push is a fresh commit, so a re-run always triggers the mirror
-workflow; the mirror side is idempotent.
+Mirror main is changed only through the admin path (Sam's own gh login,
+repository admin): the ruleset grants the repository-admin role a bypass
+for the duration of the write and takes it away again (verified), so the
+deploy key and Actions stay locked out throughout.
 
   github_release.py keys-json WHEEL VERSION
       → print release-keys.json for WHEEL
   github_release.py push VERSION DIR --phase draft|publish [--repo R]
       → the git path above (BURROW_MIRROR_GIT overrides the git URL,
         default https://github.com/R.git)
-  github_release.py workflow REF DIR [--repo R]
-      → mirror side: v<ver> → draft, publish/v<ver> → finalize
+  github_release.py scan [--repo R] [--keys PATH]
+      → mirror side (publish.yml): process every new release tag
+  github_release.py sync-keys VERSION DIR [--repo R]
+      → admin: make keys/release-keys.json on mirror main the key table the
+        release in DIR pins (first signed release / rotation); no-op if equal
+  github_release.py update-publisher [--repo R]
+      → admin: put this file + scripts/mirror/publish.yml on mirror main
+  github_release.py protect-mirror [--repo R]
+      → admin: create / re-assert the ruleset protecting mirror main
   github_release.py draft VERSION DIR [--repo R]
-      → mirror side: create/complete the draft from DIR, which must already
-        hold release-keys.json (the tag carries it)
+      → create/complete the draft from DIR (must hold release-keys.json)
   github_release.py publish VERSION DIR [--repo R] [--target SHA]
       → write DIR/release-keys.json, then `draft` directly with gh (manual
         use; CI and promote_release.sh use `push`)
@@ -62,6 +78,8 @@ assets.
 """
 from __future__ import annotations
 
+import ast
+import base64
 import hashlib
 import json
 import os
@@ -74,6 +92,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from urllib.parse import urlparse
 
 HERE = pathlib.Path(__file__).resolve().parent
@@ -85,8 +104,26 @@ MIRROR_SCRIPT = ".github/mirror/github_release.py"
 MIRROR_WORKFLOW = ".github/workflows/publish.yml"
 PUBLISH_TAG_PREFIX = "publish/"
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]*$")
-_VERSION = re.compile(r"^[0-9][0-9A-Za-z.+-]*$")
+# Release versions are plain MAJOR.MINOR.PATCH; the only tags the mirror's
+# publisher acts on are v<that> and publish/v<that>.
+_SEMVER = r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)"
+_VERSION = re.compile(rf"^{_SEMVER}$")
+_TAG = re.compile(rf"^(publish/)?v({_SEMVER})$")
 KEYS_FILE = "release-keys.json"
+# On mirror main (protected): the release keys the publisher verifies
+# latest.json.sig against. {"keys": {}} until the first signed release.
+KEY_TABLE = "keys/release-keys.json"
+PRODUCT = "burrowai-dev"
+STATUS_CONTEXT = "burrow-mirror/publish"
+RULESET_NAME = "burrow-mirror-main"
+# Repository admin (Sam's own login). Granted a bypass only while the admin
+# path writes main, then removed again.
+ADMIN_BYPASS = {"actor_id": 5, "actor_type": "RepositoryRole", "bypass_mode": "always"}
+RULESET = {
+    "name": RULESET_NAME, "target": "branch", "enforcement": "active", "bypass_actors": [],
+    "conditions": {"ref_name": {"include": ["~DEFAULT_BRANCH"], "exclude": []}},
+    "rules": [{"type": "update"}, {"type": "deletion"}, {"type": "non_fast_forward"}],
+}
 
 
 class Refuse(Exception):
@@ -115,26 +152,135 @@ def fingerprint(keys: dict) -> str:
     return " ".join(h[i:i + 4] for i in range(0, 32, 4))
 
 
-def _release_keys_module():
-    import importlib.util
-    path = HERE.parent / "src" / "burrowai_dev" / "release_keys.py"
-    spec = importlib.util.spec_from_file_location("_release_keys_gh", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
+_HEX64 = re.compile(r"^[0-9a-f]{64}$")
+_KEYS_MEMBER = "burrowai_dev/release_keys.py"
+
+
+def keys_in_source(text: str) -> dict[str, str]:
+    """The RELEASE_PUBKEYS literal of a release_keys.py, never executed.
+    Same as burrowai_dev.release_keys.keys_in_source (a test keeps them
+    equal); copied because the mirror's publisher has only this file."""
+    for node in ast.walk(ast.parse(text)):
+        target = value = None
+        if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            target, value = node.target.id, node.value
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 \
+                and isinstance(node.targets[0], ast.Name):
+            target, value = node.targets[0].id, node.value
+        if target == "RELEASE_PUBKEYS":
+            keys = ast.literal_eval(value)
+            if not isinstance(keys, dict) or not all(
+                    isinstance(k, str) and isinstance(v, str) and _HEX64.match(v.lower())
+                    for k, v in keys.items()):
+                raise ValueError("RELEASE_PUBKEYS must map key ids to 64-hex public keys")
+            return keys
+    raise ValueError("no RELEASE_PUBKEYS assignment")
+
+
+def pinned_keys(wheel: pathlib.Path) -> dict[str, str]:
+    """The release keys a burrowai-dev wheel pins ({} = none), lower-case.
+    Read out of the zip, never imported."""
+    try:
+        with zipfile.ZipFile(wheel) as z:
+            try:
+                text = z.read(_KEYS_MEMBER).decode("utf-8")
+            except KeyError:
+                return {}
+        return {k: v.lower() for k, v in keys_in_source(text).items()}
+    except Exception as e:  # noqa: BLE001
+        raise Refuse(f"{wheel.name}: can't read its release keys ({e})") from None
 
 
 def keys_json(wheel: pathlib.Path, version: str) -> bytes:
     """release-keys.json for a built wheel: the key table it pins, read out
     of the wheel (never imported). Deterministic bytes."""
-    try:
-        keys = _release_keys_module().pinned_keys_in_wheel(wheel)
-    except Exception as e:  # noqa: BLE001
-        raise Refuse(f"{wheel.name}: can't read its release keys ({e})") from None
-    keys = {k: v.lower() for k, v in keys.items()}
-    doc = {"product": "burrowai-dev", "version": version, "keys": keys,
+    keys = pinned_keys(wheel)
+    doc = {"product": PRODUCT, "version": version, "keys": keys,
            "fingerprint": fingerprint(keys) if keys else None}
     return (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode()
+
+
+# ─── Ed25519 verification (RFC 8032 §6; same code as release_sig) ────
+# Stdlib only: the mirror's publisher runs this one file.
+
+_P = 2**255 - 19
+_L = 2**252 + 27742317777372353535851937790883648493
+_D = -121665 * pow(121666, _P - 2, _P) % _P
+_SQRT_M1 = pow(2, (_P - 1) // 4, _P)
+
+
+def _inv(x: int) -> int:
+    return pow(x, _P - 2, _P)
+
+
+def _ed_add(P, Q):
+    a = (P[1] - P[0]) * (Q[1] - Q[0]) % _P
+    b = (P[1] + P[0]) * (Q[1] + Q[0]) % _P
+    c = 2 * P[3] * Q[3] * _D % _P
+    d = 2 * P[2] * Q[2] % _P
+    e, f, g, h = b - a, d - c, d + c, b + a
+    return (e * f % _P, g * h % _P, f * g % _P, e * h % _P)
+
+
+def _ed_mul(s: int, P):
+    Q = (0, 1, 1, 0)
+    while s > 0:
+        if s & 1:
+            Q = _ed_add(Q, P)
+        P = _ed_add(P, P)
+        s >>= 1
+    return Q
+
+
+def _ed_equal(P, Q) -> bool:
+    return ((P[0] * Q[2] - Q[0] * P[2]) % _P == 0
+            and (P[1] * Q[2] - Q[1] * P[2]) % _P == 0)
+
+
+def _recover_x(y: int, sign: int):
+    if y >= _P:
+        return None
+    x2 = (y * y - 1) * _inv(_D * y * y + 1)
+    if x2 == 0:
+        return None if sign else 0
+    x = pow(x2, (_P + 3) // 8, _P)
+    if (x * x - x2) % _P != 0:
+        x = x * _SQRT_M1 % _P
+    if (x * x - x2) % _P != 0:
+        return None
+    if (x & 1) != sign:
+        x = _P - x
+    return x
+
+
+_GY = 4 * _inv(5) % _P
+_GX = _recover_x(_GY, 0)
+_G = (_GX, _GY, 1, _GX * _GY % _P)
+
+
+def _decompress(s: bytes):
+    if len(s) != 32:
+        return None
+    y = int.from_bytes(s, "little")
+    sign = y >> 255
+    y &= (1 << 255) - 1
+    x = _recover_x(y, sign)
+    if x is None:
+        return None
+    return (x, y, 1, x * y % _P)
+
+
+def ed25519_verify(public: bytes, msg: bytes, signature: bytes) -> bool:
+    if len(public) != 32 or len(signature) != 64:
+        return False
+    A, R = _decompress(public), _decompress(signature[:32])
+    if A is None or R is None:
+        return False
+    s = int.from_bytes(signature[32:], "little")
+    if s >= _L:
+        return False
+    h = int.from_bytes(hashlib.sha512(signature[:32] + public + msg).digest(), "little") % _L
+    return _ed_equal(_ed_mul(s, _G), _ed_add(R, _ed_mul(h, A)))
 
 
 def _basename(url: str) -> str:
@@ -144,11 +290,17 @@ def _basename(url: str) -> str:
     return name
 
 
+def _semver(version: str) -> tuple[int, int, int]:
+    m = _VERSION.match(version or "")
+    if not m:
+        raise Refuse(f"bad version {version!r} (want MAJOR.MINOR.PATCH)")
+    return tuple(int(x) for x in m.groups())
+
+
 def _manifest_files(version: str, d: pathlib.Path) -> list[tuple[str, str]]:
     """[(filename, sha256)] — the worker wheel first, then each dep — from
     DIR/latest.json, which must be for VERSION."""
-    if not _VERSION.match(version):
-        raise Refuse(f"bad version {version!r}")
+    _semver(version)
     try:
         m = json.loads((d / "latest.json").read_bytes())
     except (OSError, ValueError) as e:
@@ -215,8 +367,100 @@ def _require_keys(version: str, d: pathlib.Path) -> None:
         raise Refuse(f"{KEYS_FILE} is not a key table for {version}")
 
 
+def empty_table() -> bytes:
+    """keys/release-keys.json before any release key exists."""
+    return (json.dumps({"product": PRODUCT, "keys": {}, "signed_since": None},
+                       indent=2, sort_keys=True) + "\n").encode()
+
+
+def parse_table(raw: bytes) -> dict:
+    """The key table on mirror main. Anything malformed is a refusal — the
+    publisher fails closed rather than guess which releases need a
+    signature."""
+    try:
+        t = json.loads(raw)
+    except ValueError as e:
+        raise Refuse(f"{KEY_TABLE}: not JSON ({e})") from None
+    if not isinstance(t, dict) or t.get("product") != PRODUCT \
+            or not isinstance(t.get("keys"), dict):
+        raise Refuse(f"{KEY_TABLE}: not a {PRODUCT} key table")
+    keys = t["keys"]
+    if not all(isinstance(k, str) and _SAFE_NAME.match(k) and isinstance(v, str)
+               and _HEX64.match(v) for k, v in keys.items()):
+        raise Refuse(f"{KEY_TABLE}: keys must map key ids to lower-case 64-hex public keys")
+    since = t.get("signed_since")
+    if keys:
+        if not isinstance(since, str):
+            raise Refuse(f"{KEY_TABLE}: has keys but no signed_since version")
+        _semver(since)
+    elif since is not None:
+        raise Refuse(f"{KEY_TABLE}: signed_since without keys")
+    return {"keys": dict(keys), "signed_since": since}
+
+
+def verify_release(version: str, d: pathlib.Path, table: dict) -> str:
+    """The mirror publisher's checks on the release files in DIR (read from
+    a tag as data), against the key table from mirror main. Returns the
+    release-notes line describing the signature; raises Refuse.
+
+      - every listed file is there with the sha256 latest.json says, and
+        latest.json is for VERSION (assets);
+      - release-keys.json is exactly the key table the wheel pins;
+      - table empty (no release key exists yet): the release must be
+        unsigned (no .sig, wheel pins nothing) and is marked `unsigned`;
+      - table has keys: a latest.json.sig must verify against the TABLE's
+        keys (not the release's own), with the manifest's product, key_id
+        (= the signer) and version right; a release without one is refused
+        for any version >= the table's signed_since."""
+    names = assets(version, d)
+    _require_keys(version, d)
+    wheel = d / _manifest_files(version, d)[0][0]
+    wheel_keys = pinned_keys(wheel)
+    if (d / KEYS_FILE).read_bytes() != keys_json(wheel, version):
+        raise Refuse(f"{KEYS_FILE} is not the key table {wheel.name} pins")
+    raw = (d / "latest.json").read_bytes()
+    keys, since = table["keys"], table["signed_since"]
+    if "latest.json.sig" not in names:
+        if not keys:
+            if wheel_keys:
+                raise Refuse(f"{wheel.name} pins release keys but the mirror's key table "
+                             f"({KEY_TABLE} on main) is empty — run `sync-keys` first")
+            return ("**unsigned** — published before any release key existed "
+                    f"({KEY_TABLE} on the mirror's main is empty).")
+        if _semver(version) >= _semver(since):
+            raise Refuse(f"{version} has no latest.json.sig; releases since {since} must be "
+                         "signed")
+        if wheel_keys:
+            raise Refuse(f"{wheel.name} pins release keys but latest.json is unsigned")
+        return f"**unsigned** — predates signed releases (signed since {since})."
+    if not keys:
+        raise Refuse(f"{version} is signed but the mirror's key table ({KEY_TABLE} on main) "
+                     "is empty — run `sync-keys` first")
+    try:
+        sig = base64.b64decode((d / "latest.json.sig").read_text().strip(), validate=True)
+    except Exception as e:  # noqa: BLE001
+        raise Refuse(f"latest.json.sig is not base64 ({e})") from None
+    signer = next((kid for kid, pub in sorted(keys.items())
+                   if ed25519_verify(bytes.fromhex(pub), raw, sig)), None)
+    if signer is None:
+        raise Refuse(f"latest.json.sig for {version} doesn't verify against any key in "
+                     f"{KEY_TABLE} on the mirror's main")
+    def no_dup(pairs):
+        if len({k for k, _ in pairs}) != len(pairs):
+            raise Refuse("signed manifest has duplicate keys")
+        return dict(pairs)
+    m = json.loads(raw, object_pairs_hook=no_dup)
+    if m.get("product") != PRODUCT:
+        raise Refuse(f"signed manifest product {m.get('product')!r} is not {PRODUCT!r}")
+    if m.get("key_id") != signer:
+        raise Refuse(f"signed manifest key_id {m.get('key_id')!r} != signing key {signer!r}")
+    return (f"Signed: latest.json.sig verified by the mirror's publisher against "
+            f"{KEY_TABLE} on its protected main (key `{signer}`, table fingerprint "
+            f"`{fingerprint(keys)}`).")
+
+
 def draft(version: str, d: pathlib.Path, repo: str, target: str | None = None,
-          *, verify_tag: bool = True) -> int:
+          *, verify_tag: bool = True, notes_extra: str = "") -> int:
     """Create (or complete) the DRAFT release v<version> from DIR, which
     already holds release-keys.json. With verify_tag the tag must already
     exist (the mirror workflow: the tag IS the pushed asset commit)."""
@@ -231,6 +475,8 @@ def draft(version: str, d: pathlib.Path, repo: str, target: str | None = None,
                  "(DESIGN_e2e_encryption.md §3.3).")
         if fp:
             notes += f"\n\nRelease key fingerprint: `{fp}` (also in release-keys.json)."
+        if notes_extra:
+            notes += f"\n\n{notes_extra}"
         args = ["release", "create", tag, "--repo", repo, "--draft",
                 "--title", f"burrowai-dev {version}", "--notes", notes]
         if verify_tag:
@@ -359,14 +605,13 @@ def public_state(version: str, d: pathlib.Path, names: list[str], repo: str) -> 
     return "identical" if found == len(names) else "partial"
 
 
-def _runs_for(repo: str, sha: str) -> list[dict]:
-    """The mirror's workflow runs for commit SHA (public repo: gh's token, or
-    unauthenticated if that is refused)."""
-    path = f"repos/{repo}/actions/runs?head_sha={sha}&event=push&per_page=20"
+def _api_get(path: str):
+    """GET a GitHub API path: gh's token first, unauthenticated (public repo)
+    if that is refused. None on any failure (callers poll)."""
     p = _run(["api", path], check=False)
     if p.returncode == 0:
         try:
-            return list(json.loads(p.stdout).get("workflow_runs") or [])
+            return json.loads(p.stdout)
         except ValueError:
             pass
     api = os.environ.get("BURROW_MIRROR_API", "https://api.github.com")
@@ -374,55 +619,52 @@ def _runs_for(repo: str, sha: str) -> list[dict]:
                                  headers={"Accept": "application/vnd.github+json"})
     try:
         with urllib.request.urlopen(req, timeout=30) as r:
-            return list(json.loads(r.read()).get("workflow_runs") or [])
+            return json.loads(r.read())
     except Exception:  # noqa: BLE001 — transient; the caller keeps polling
-        return []
+        return None
+
+
+def _mirror_status(repo: str, sha: str) -> dict | None:
+    """The publisher's latest `burrow-mirror/publish` status on commit SHA."""
+    got = _api_get(f"repos/{repo}/commits/{sha}/statuses?per_page=100")
+    if not isinstance(got, list):
+        return None
+    mine = [x for x in got if isinstance(x, dict) and x.get("context") == STATUS_CONTEXT]
+    return mine[0] if mine else None          # newest first
 
 
 def _wait_for_mirror(repo: str, sha: str, ref: str) -> None:
-    """Block until the mirror's publish.yml run for commit SHA finishes;
-    Refuse unless it succeeded."""
-    timeout = float(os.environ.get("BURROW_MIRROR_WAIT", "900"))
-    poll = float(os.environ.get("BURROW_MIRROR_POLL", "10"))
+    """Block until the mirror's publisher (a scheduled run from main) has
+    processed tag commit SHA; Refuse unless it succeeded. Scheduled runs can
+    start late, hence the long default."""
+    timeout = float(os.environ.get("BURROW_MIRROR_WAIT", "3600"))
+    poll = float(os.environ.get("BURROW_MIRROR_POLL", "30"))
     deadline = time.monotonic() + timeout
     while True:
-        runs = [r for r in _runs_for(repo, sha)
-                if r.get("head_sha") == sha
-                and MIRROR_WORKFLOW in str(r.get("path", MIRROR_WORKFLOW))]
-        done = [r for r in runs if r.get("status") == "completed"]
-        if done:
-            r = done[0]
-            if r.get("conclusion") != "success":
-                raise Refuse(f"the mirror's publish run for {ref} ended "
-                             f"'{r.get('conclusion')}': {r.get('html_url', '')}")
-            print(f"   mirror run for {ref} succeeded")
+        st = _mirror_status(repo, sha)
+        if st and st.get("state") in ("success", "failure", "error"):
+            if st["state"] != "success":
+                raise Refuse(f"the mirror's publisher refused {ref}: "
+                             f"{st.get('description', '')} {st.get('target_url', '')}".rstrip())
+            print(f"   mirror publisher processed {ref}")
             return
         if time.monotonic() >= deadline:
-            state = runs[0].get("status") if runs else "not started"
-            raise Refuse(f"the mirror's publish run for {ref} didn't finish in "
-                         f"{int(timeout)}s ({state})")
+            raise Refuse(f"the mirror's publisher didn't process {ref} within {int(timeout)}s "
+                         "(it runs on a schedule from the mirror's main)")
         time.sleep(poll)
 
 
-def _asset_commit(version: str, d: pathlib.Path, names: list[str], repo: str,
-                  phase: str, work: pathlib.Path) -> str:
-    """One commit on top of the mirror's main with assets/ = exactly NAMES
-    from DIR, plus the mirror's script + workflow from this checkout. → sha"""
-    url = _git_url(repo)
+def _asset_commit(version: str, d: pathlib.Path, names: list[str], phase: str,
+                  work: pathlib.Path) -> str:
+    """A ROOT commit holding exactly assets/NAMES from DIR — data only: no
+    workflow, no script (the publisher's code comes from mirror main). → sha"""
     _git(["init", "-q", str(work)])
-    _git(["fetch", "-q", "--depth", "1", url, "refs/heads/main"], cwd=work)
-    _git(["checkout", "-q", "--detach", "FETCH_HEAD"], cwd=work)
-    shutil.rmtree(work / ASSET_DIR, ignore_errors=True)
     (work / ASSET_DIR).mkdir()
     for n in names:
         shutil.copyfile(d / n, work / ASSET_DIR / n)
-    for src, dst in ((pathlib.Path(__file__).resolve(), MIRROR_SCRIPT),
-                     (HERE / "mirror" / "publish.yml", MIRROR_WORKFLOW)):
-        (work / dst).parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(src, work / dst)
     _git(["add", "-A"], cwd=work)
     _git(["-c", "user.name=burrowai-dev release", "-c", "user.email=releases@burrowai.dev",
-          "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty",
+          "-c", "commit.gpgsign=false", "commit", "-q",
           "-m", f"burrowai-dev {version} ({phase})"], cwd=work)
     return _git(["rev-parse", "HEAD"], cwd=work).stdout.strip()
 
@@ -447,9 +689,16 @@ def push(version: str, d: pathlib.Path, repo: str, phase: str) -> int:
     ref = tag if phase == "draft" else f"{PUBLISH_TAG_PREFIX}{tag}"
     with tempfile.TemporaryDirectory() as tmp:
         work = pathlib.Path(tmp) / "mirror"
-        sha = _asset_commit(version, d, names, repo, phase, work)
+        sha = _asset_commit(version, d, names, phase, work)
+        # Every push is a fresh commit (new timestamp) → a new sha the
+        # publisher hasn't seen, so a re-run is always re-processed.
         _git(["push", "-q", "--force", _git_url(repo), f"HEAD:refs/tags/{ref}"], cwd=work)
-    print(f"   pushed {ref} → {sha[:12]} ({len(names)} assets)")
+    print(f"   pushed {ref} → {sha[:12]} ({len(names)} assets); waiting for the mirror's "
+          "publisher")
+    # Best effort: start a publisher run now instead of at the next 5-minute
+    # tick. Works with Sam's own gh login (promote_release.sh); CI's token
+    # can't dispatch another repo's workflow, so CI waits for the schedule.
+    _run(["workflow", "run", "publish.yml", "--repo", repo, "--ref", "main"], check=False)
     _wait_for_mirror(repo, sha, ref)
     if phase == "draft":
         print(f"✓ draft GitHub release {tag} matches {d}")
@@ -460,18 +709,298 @@ def push(version: str, d: pathlib.Path, repo: str, phase: str) -> int:
             print(f"✓ GitHub release {tag} is public and byte-identical")
             return 0
         if i + 1 < tries:
-            time.sleep(float(os.environ.get("BURROW_MIRROR_POLL", "10")))
+            time.sleep(float(os.environ.get("BURROW_MIRROR_POLL", "30")))
     raise Refuse(f"GitHub release {tag} was published but its public copy doesn't serve "
                  "every asset yet")
 
 
-def workflow(ref: str, d: pathlib.Path, repo: str) -> int:
-    """The mirror's publish.yml: v<ver> → draft, publish/v<ver> → finalize."""
-    if ref.startswith(PUBLISH_TAG_PREFIX + "v"):
-        return finalize(ref[len(PUBLISH_TAG_PREFIX) + 1:], d, repo)
-    if ref.startswith("v"):
-        return draft(ref[1:], d, repo, verify_tag=True)
-    raise Refuse(f"not a release tag: {ref!r}")
+# ─── the mirror's publisher (publish.yml → scan, code from main) ─────
+
+def _marker(sha: str) -> str:
+    return f"<!-- mirror-processed {sha} -->"
+
+
+def _list_releases(repo: str) -> dict[str, dict]:
+    p = _run(["api", "--paginate", f"repos/{repo}/releases?per_page=100",
+              "--jq", ".[] | {tag_name, draft, body}"])
+    out = {}
+    for line in p.stdout.splitlines():
+        if line.strip():
+            r = json.loads(line)
+            out[r["tag_name"]] = r
+    return out
+
+
+def _release_tags(url: str) -> list[tuple[str, str, str]]:
+    """[(tag, version, commit sha)] for every v<semver> / publish/v<semver>
+    tag on the mirror, oldest version first, each v<ver> before its
+    publish/v<ver>. Other tags are ignored."""
+    p = _git(["ls-remote", "--tags", url])
+    refs: dict[str, str] = {}
+    for line in p.stdout.splitlines():
+        sha, _, ref = line.partition("\t")
+        if not ref.startswith("refs/tags/"):
+            continue
+        name = ref[len("refs/tags/"):]
+        if name.endswith("^{}"):
+            refs[name[:-3]] = sha                  # annotated: the commit
+        else:
+            refs.setdefault(name, sha)
+    out = []
+    for name, sha in refs.items():
+        m = _TAG.match(name)
+        if m:
+            out.append((name, m.group(2), sha))
+        else:
+            print(f"   ignoring tag {name!r} (not v<semver> / publish/v<semver>)")
+    out.sort(key=lambda x: (_semver(x[1]), x[0].startswith(PUBLISH_TAG_PREFIX)))
+    return out
+
+
+def _extract_assets(url: str, tag: str, dest: pathlib.Path, git_dir: pathlib.Path) -> str:
+    """Fetch tag TAG into a scratch bare repo and write ONLY its assets/*
+    regular files into DEST, as data. Nothing else in the commit is looked
+    at, let alone run. → the commit sha that was read."""
+    if not git_dir.exists():
+        _git(["init", "-q", "--bare", str(git_dir)])
+    _git(["--git-dir", str(git_dir), "fetch", "-q", "--no-tags", "--depth", "1", url,
+          f"+refs/tags/{tag}:refs/scan/x"])
+    sha = _git(["--git-dir", str(git_dir), "rev-parse", "refs/scan/x^{commit}"]).stdout.strip()
+    top = _git(["--git-dir", str(git_dir), "ls-tree", "--name-only", "-z", sha]).stdout
+    extra = sorted(n for n in top.split("\0") if n and n != ASSET_DIR)
+    if extra:
+        # An upload is assets/ and nothing else. Anything more (a
+        # .github/workflows file above all) is not ours: refuse it loudly.
+        raise Refuse(f"{tag} holds more than {ASSET_DIR}/ ({', '.join(extra)}) — not an "
+                     "upload from the release pipeline")
+    ls = _git(["--git-dir", str(git_dir), "ls-tree", "-z", sha, f"{ASSET_DIR}/"]).stdout
+    dest.mkdir(parents=True, exist_ok=True)
+    for entry in filter(None, ls.split("\0")):
+        meta, _, path = entry.partition("\t")
+        mode, kind, obj = meta.split()
+        name = path[len(ASSET_DIR) + 1:]
+        if mode != "100644" or kind != "blob" or not _SAFE_NAME.match(name):
+            print(f"   {tag}: skipping {path!r} (not a plain asset file)")
+            continue
+        blob = subprocess.run(["git", "--git-dir", str(git_dir), "cat-file", "blob", obj],
+                              capture_output=True, check=True).stdout
+        (dest / name).write_bytes(blob)
+    return sha
+
+
+def _set_status(repo: str, sha: str, state: str, desc: str) -> None:
+    run_url = ""
+    if os.environ.get("GITHUB_RUN_ID"):
+        run_url = (f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}"
+                   f"/actions/runs/{os.environ['GITHUB_RUN_ID']}")
+    args = ["api", "-X", "POST", f"repos/{repo}/statuses/{sha}", "-f", f"state={state}",
+            "-f", f"context={STATUS_CONTEXT}", "-f", f"description={desc[:139]}"]
+    if run_url:
+        args += ["-f", f"target_url={run_url}"]
+    _run(args)
+
+
+def _note_processed(repo: str, tag: str, sha: str) -> None:
+    """Record SHA in release TAG's notes so later scans skip it without an
+    API call per tag."""
+    rel = _list_releases(repo).get(tag)
+    if rel is None:
+        return
+    body = rel.get("body") or ""
+    if _marker(sha) not in body:
+        _run(["release", "edit", tag, "--repo", repo, "--notes", f"{body}\n{_marker(sha)}"])
+
+
+def scan(repo: str, keys_path: pathlib.Path) -> int:
+    """One publisher pass. Runs ONLY from the mirror's protected main
+    (publish.yml on schedule / workflow_dispatch). For each release tag
+    commit not processed yet: read its assets as data, verify_release
+    against the key table on main, then draft (v<ver>) or publish
+    (publish/v<ver>), and record the outcome as a commit status."""
+    try:
+        table = parse_table(keys_path.read_bytes())
+    except OSError as e:
+        raise Refuse(f"{keys_path}: can't read the key table ({e})") from None
+    url = _git_url(repo)
+    rels = _list_releases(repo)
+    refused = 0
+    with tempfile.TemporaryDirectory() as tmp:
+        git_dir = pathlib.Path(tmp) / "tags.git"
+        for i, (tag, version, sha) in enumerate(_release_tags(url)):
+            rel_tag = f"v{version}"
+            rel = rels.get(rel_tag)
+            if rel is not None and _marker(sha) in (rel.get("body") or ""):
+                continue
+            if rel is None and _mirror_status(repo, sha):
+                continue                       # refused before any release existed
+            d = pathlib.Path(tmp) / f"t{i}"
+            try:
+                sha = _extract_assets(url, tag, d, git_dir)
+                notes = verify_release(version, d, table)
+                if tag.startswith(PUBLISH_TAG_PREFIX):
+                    finalize(version, d, repo)
+                else:
+                    draft(version, d, repo, verify_tag=True, notes_extra=notes)
+                _set_status(repo, sha, "success", f"{tag}: done")
+                print(f"✓ {tag} ({sha[:12]})")
+            except Refuse as e:
+                refused += 1
+                print(f"✗ {tag} ({sha[:12]}): {e}", file=sys.stderr)
+                try:
+                    _set_status(repo, sha, "failure", f"{tag}: {e}")
+                except Refuse as e2:            # e.g. a tag that isn't a commit
+                    print(f"   (couldn't record the refusal: {e2})", file=sys.stderr)
+            _note_processed(repo, rel_tag, sha)
+            rels = _list_releases(repo)
+    # A refusal fails this run (GitHub notifies), once: the tag is recorded.
+    return 1 if refused else 0
+
+
+# ─── admin path: mirror main (Sam's own gh login, repository admin) ──
+
+def _find_ruleset(repo: str) -> dict | None:
+    p = _run(["api", f"repos/{repo}/rulesets?per_page=100"])
+    for r in json.loads(p.stdout or "[]"):
+        if r.get("name") == RULESET_NAME:
+            return json.loads(_run(["api", f"repos/{repo}/rulesets/{r['id']}"]).stdout)
+    return None
+
+
+def _put_ruleset(repo: str, rid: int, body: dict) -> dict:
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(body, f)
+    try:
+        return json.loads(_run(["api", "-X", "PUT", f"repos/{repo}/rulesets/{rid}",
+                                "--input", f.name]).stdout)
+    finally:
+        os.unlink(f.name)
+
+
+def _locked(rs: dict) -> bool:
+    return (rs.get("enforcement") == "active" and not rs.get("bypass_actors")
+            and {r.get("type") for r in rs.get("rules") or []}
+            >= {"update", "deletion", "non_fast_forward"}
+            and "~DEFAULT_BRANCH" in ((rs.get("conditions") or {}).get("ref_name") or {})
+            .get("include", []))
+
+
+def protect_mirror(repo: str) -> int:
+    """Create (or re-assert) the ruleset that makes mirror main unwritable:
+    update, deletion and force-push blocked, no bypass actors."""
+    rs = _find_ruleset(repo)
+    if rs is None:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(RULESET, f)
+        try:
+            rs = json.loads(_run(["api", "-X", "POST", f"repos/{repo}/rulesets",
+                                  "--input", f.name]).stdout)
+        finally:
+            os.unlink(f.name)
+    elif not _locked(rs):
+        rs = _put_ruleset(repo, rs["id"], RULESET)
+    rs = _find_ruleset(repo)
+    if rs is None or not _locked(rs):
+        raise Refuse(f"ruleset {RULESET_NAME} on {repo} isn't in force")
+    print(f"✓ {repo} main protected by ruleset {rs['id']} ({RULESET_NAME})")
+    return 0
+
+
+def _main_head(repo: str) -> str:
+    out = _git(["ls-remote", _git_url(repo), "refs/heads/main"]).stdout.split()
+    return out[0] if out else ""
+
+
+def _admin_write_main(repo: str, files: dict[str, bytes], message: str) -> list[str]:
+    """Commit FILES to mirror main through the contents API: the ruleset
+    grants the repository-admin role a bypass for the write and loses it
+    again right after (always, and verified). The deploy key and Actions
+    are never bypass actors. → the commit shas, in order."""
+    rs = _find_ruleset(repo)
+    if rs is None or not _locked(rs):
+        raise Refuse(f"mirror main isn't protected (ruleset {RULESET_NAME}) — run "
+                     "`protect-mirror` first")
+    shas: list[str] = []
+    _put_ruleset(repo, rs["id"], {"bypass_actors": [ADMIN_BYPASS]})
+    try:
+        for path, data in files.items():
+            cur = _run(["api", f"repos/{repo}/contents/{path}?ref=main"], check=False)
+            body = {"message": message, "branch": "main",
+                    "content": base64.b64encode(data).decode()}
+            if cur.returncode == 0:
+                body["sha"] = json.loads(cur.stdout)["sha"]
+            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+                json.dump(body, f)
+            try:
+                res = _run(["api", "-X", "PUT", f"repos/{repo}/contents/{path}",
+                            "--input", f.name])
+            finally:
+                os.unlink(f.name)
+            shas.append(json.loads(res.stdout)["commit"]["sha"])
+    finally:
+        _put_ruleset(repo, rs["id"], {"bypass_actors": []})
+        after = _find_ruleset(repo)
+        if after is None or not _locked(after):
+            raise Refuse(f"ruleset {RULESET_NAME} did NOT go back to no-bypass — fix it now "
+                         "(`protect-mirror`)")
+    head = _main_head(repo)
+    if shas and head != shas[-1]:
+        raise Refuse(f"mirror main is at {head[:12]}, not the commit just written "
+                     f"({shas[-1][:12]}) — something else wrote main during the window")
+    return shas
+
+
+def _main_file(repo: str, path: str) -> bytes | None:
+    got = _api_get(f"repos/{repo}/contents/{path}?ref=main")
+    if not isinstance(got, dict) or "content" not in got:
+        return None
+    return base64.b64decode(got["content"])
+
+
+def sync_keys(version: str, d: pathlib.Path, repo: str) -> int:
+    """Make the key table on mirror main the one the release in DIR pins
+    (first signed release, or a key rotation); signed_since is set once, to
+    the first version that needed it. No-op if it already matches. Run by
+    promote_release.sh before the draft push."""
+    assets(version, d)
+    wheel = d / _manifest_files(version, d)[0][0]
+    want = pinned_keys(wheel)
+    if not want:
+        raise Refuse(f"{wheel.name} pins no release keys — nothing to put in {KEY_TABLE}")
+    m = json.loads((d / "latest.json").read_bytes())
+    if (d / "latest.json.sig").is_file() and m.get("key_id") not in want:
+        raise Refuse(f"{version} is signed by {m.get('key_id')!r}, which its own key table "
+                     "doesn't contain")
+    raw = _main_file(repo, KEY_TABLE)
+    if raw is None:
+        raise Refuse(f"can't read {KEY_TABLE} from {repo} main")
+    cur = parse_table(raw)
+    if cur["keys"] == want:
+        print(f"✓ {KEY_TABLE} on {repo} main already pins these keys")
+        return 0
+    new = {"product": PRODUCT, "keys": want, "signed_since": cur["signed_since"] or version}
+    data = (json.dumps(new, indent=2, sort_keys=True) + "\n").encode()
+    _admin_write_main(repo, {KEY_TABLE: data}, f"release keys for {version} "
+                      f"(fingerprint {fingerprint(want)})")
+    print(f"✓ {KEY_TABLE} on {repo} main: {fingerprint(want)} (signed since "
+          f"{new['signed_since']})")
+    return 0
+
+
+def update_publisher(repo: str) -> int:
+    """Put this script + scripts/mirror/publish.yml on mirror main (the
+    publisher's code). Unchanged files are skipped."""
+    files = {}
+    for src, dst in ((pathlib.Path(__file__).resolve(), MIRROR_SCRIPT),
+                     (HERE / "mirror" / "publish.yml", MIRROR_WORKFLOW)):
+        data = src.read_bytes()
+        if _main_file(repo, dst) != data:
+            files[dst] = data
+    if not files:
+        print(f"✓ the publisher on {repo} main is current")
+        return 0
+    _admin_write_main(repo, files, "publisher: update from burrowai-dev")
+    print(f"✓ updated {', '.join(files)} on {repo} main")
+    return 0
 
 
 def _opt(argv: list[str], flag: str, default=None):
@@ -496,8 +1025,15 @@ def main(argv: list[str]) -> int:
             return 0
         if len(argv) == 3 and argv[0] == "push" and phase:
             return push(argv[1], pathlib.Path(argv[2]), repo, phase)
-        if len(argv) == 3 and argv[0] == "workflow":
-            return workflow(argv[1], pathlib.Path(argv[2]), repo)
+        keys = _opt(argv, "--keys", str(HERE.parent.parent / KEY_TABLE))
+        if argv == ["scan"]:
+            return scan(repo, pathlib.Path(keys))
+        if len(argv) == 3 and argv[0] == "sync-keys":
+            return sync_keys(argv[1], pathlib.Path(argv[2]), repo)
+        if argv == ["update-publisher"]:
+            return update_publisher(repo)
+        if argv == ["protect-mirror"]:
+            return protect_mirror(repo)
         if len(argv) == 3 and argv[0] == "draft":
             return draft(argv[1], pathlib.Path(argv[2]), repo, target)
         if len(argv) == 3 and argv[0] == "publish":
