@@ -1,14 +1,18 @@
 # Mirror repo syu16688/burrowai-dev-releases: the PUBLISHER that turns
-# release tags into GitHub Releases. Canonical copy: burrowai-dev
+# release uploads into GitHub Releases. Canonical copy: burrowai-dev
 # scripts/mirror/publish.yml; it is put on the mirror's main (protected by
 # the ruleset `burrow-mirror-main`) by `scripts/github_release.py
 # update-publisher` — Sam's admin login, never CI.
 #
-# Uploaders (CI's write deploy key, promote_release.sh) only push DATA: tags
-# v<semver> / publish/v<semver> whose commit holds assets/<files>. Nothing in
-# a tag is ever run. There is deliberately NO push trigger — `schedule` and
+# Uploaders (CI's write deploy key, promote_release.sh) never write this
+# repo: they push DATA tags v<semver> / publish/v<semver>, whose commit holds
+# assets/<files>, to the separate public DROP repo
+# syu16688/burrowai-dev-releases-drop, which has GitHub Actions DISABLED —
+# so a tag carrying its own workflow is never run anywhere. This repo has no
+# deploy key. There is deliberately NO push trigger — `schedule` and
 # `workflow_dispatch` always run the workflow on the default branch, and the
-# job clones main for the code:
+# job clones main for the code. The drop repo is read over public git with
+# no credentials:
 #
 #   tag v<version>          → DRAFT release from the tag's assets/ (verified:
 #                             sha256s, key table, and latest.json.sig against
@@ -16,13 +20,15 @@
 #   tag publish/v<version>  → re-verify, require the draft's bytes, publish
 #
 # GitHub pauses scheduled workflows of a public repo after 60 days without
-# repository activity; release tag pushes are activity, and `push` (Sam's
-# login) also dispatches a run, so a stalled schedule shows up as `push`
-# timing out — re-enable with `gh workflow enable publish.yml`.
+# repository activity (uploads land in the drop repo, so they don't count;
+# release publishes and results commits here do). `push` (Sam's login) also
+# dispatches a run, so a stalled schedule shows up as `push` timing out —
+# re-enable with `gh workflow enable publish.yml`.
 #
-# Each processed tag commit gets commit status `burrow-mirror/publish`
-# (success / failure), which the uploader waits for. Nothing secret lives
-# here: the only credential is this run's own GITHUB_TOKEN.
+# Each processed upload gets results/<tag commit sha>.json on this repo's
+# `results` branch (success / failure), which the uploader polls. Nothing
+# secret lives here: the only credential is this run's own GITHUB_TOKEN,
+# and it is never sent to the drop repo.
 name: publish
 
 on:
@@ -32,7 +38,6 @@ on:
 
 permissions:
   contents: write
-  statuses: write
 
 concurrency:
   group: mirror-publish
@@ -46,7 +51,7 @@ jobs:
     steps:
       - name: Publisher code from main only
         run: git clone -q --depth 1 --branch main "https://github.com/$GITHUB_REPOSITORY.git" publisher
-      - name: Draft or publish new release tags (their files are data)
+      - name: Draft or publish the drop repo's new release tags (their files are data)
         working-directory: publisher
         env:
           GH_TOKEN: ${{ github.token }}
