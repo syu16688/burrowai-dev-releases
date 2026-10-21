@@ -13,30 +13,38 @@ Assets, byte-identical to what goes to burrowai.dev:
   WHEEL pins + its fingerprint; generated here from the wheel itself).
 
 Who controls what (Codex r12 P1): the uploader supplies DATA only, never
-code. Whoever holds the write deploy key (CI's MIRROR_DEPLOY_KEY) can push
-tags, but the code that runs with the mirror's `contents: write` token comes
-only from the mirror's main, which a repository ruleset (burrow-mirror-main)
-makes unwritable by the deploy key, by Actions and by anyone without
+code, and never writes the mirror at all. Uploads go to a separate PUBLIC
+DROP repo, syu16688/burrowai-dev-releases-drop, which has GitHub Actions
+DISABLED (nothing pushed there is ever executed — a tag carrying its own
+.github/workflows/x.yml with a push trigger can't run, which a tag on the
+mirror itself could, with self-granted contents: write). CI's write deploy
+key (MIRROR_DEPLOY_KEY) exists only on the drop repo; the mirror has no
+deploy key. The code that runs with the mirror's `contents: write` token
+comes only from the mirror's main, which a repository ruleset
+(burrow-mirror-main) makes unwritable by Actions and by anyone without
 changing the ruleset:
 
   1. `push VERSION DIR --phase draft` (CI with the deploy key over ssh;
      Sam's machine with his own git login) refuses if a PUBLISHED
      v<version> already serves different bytes, then pushes ONE root commit
-     holding nothing but assets/<files> as tag v<version> (data; no
-     workflow, no script).
+     holding nothing but assets/<files> as tag v<version> to the DROP repo
+     (data; no workflow, no script).
   2. The mirror's publish.yml runs on `schedule` (every 5 min) and
      `workflow_dispatch` only — both always use the workflow on the default
      branch; there is no push trigger. It clones main and runs `scan`, which
-     lists the tags v<semver> / publish/v<semver> (anything else is
-     ignored), reads ONLY the assets/* blobs of each new tag commit as data,
+     lists the drop repo's tags v<semver> / publish/v<semver> over
+     unauthenticated public git (no token is ever sent to the drop repo;
+     anything else is ignored), reads ONLY the assets/* blobs of each new
+     tag commit as data,
      verifies them (`verify_release`: wheel/dep sha256 against latest.json,
      release-keys.json against the wheel, and — once the key table on main,
      keys/release-keys.json, has keys — latest.json.sig against THAT table;
      an unsigned release for a version >= the table's `signed_since` is
      refused) and drafts (v<ver>) or publishes (publish/v<ver>) the release.
-     It reports the outcome as commit status `burrow-mirror/publish` on the
-     tag's commit; `push` waits for that status and fails if it isn't
-     success.
+     It records the outcome in the MIRROR as results/<tag commit sha>.json
+     on the mirror's `results` branch (written with the workflow's own
+     GITHUB_TOKEN; nobody else but Sam can write the mirror); `push` polls
+     that file (public read) and fails unless it says success.
   3. After latest.json is live on burrowai.dev: `push VERSION DIR --phase
      publish` pushes the same files as tag publish/v<version>; the scan
      re-verifies, re-downloads every draft asset, requires identical bytes
@@ -51,8 +59,9 @@ deploy key and Actions stay locked out throughout.
   github_release.py keys-json WHEEL VERSION
       → print release-keys.json for WHEEL
   github_release.py push VERSION DIR --phase draft|publish [--repo R]
-      → the git path above (BURROW_MIRROR_GIT overrides the git URL,
-        default https://github.com/R.git)
+      → the git path above: tags go to the drop repo (BURROW_MIRROR_DROP_REPO,
+        default R-drop; BURROW_MIRROR_DROP_GIT overrides its git URL, default
+        https://github.com/<drop>.git)
   github_release.py scan [--repo R] [--keys PATH]
       → mirror side (publish.yml): process every new release tag
   github_release.py sync-keys VERSION DIR [--repo R]
@@ -62,6 +71,10 @@ deploy key and Actions stay locked out throughout.
       → admin: put this file + scripts/mirror/publish.yml on mirror main
   github_release.py protect-mirror [--repo R]
       → admin: create / re-assert the ruleset protecting mirror main
+  github_release.py check-setup [--repo R]
+      → admin: verify the trust setup — drop repo public with Actions
+        disabled and exactly one (write) deploy key, mirror with NO deploy
+        key, ruleset in force
   github_release.py draft VERSION DIR [--repo R]
       → create/complete the draft from DIR (must hold release-keys.json)
   github_release.py publish VERSION DIR [--repo R] [--target SHA]
@@ -115,6 +128,11 @@ KEYS_FILE = "release-keys.json"
 KEY_TABLE = "keys/release-keys.json"
 PRODUCT = "burrowai-dev"
 STATUS_CONTEXT = "burrow-mirror/publish"
+# The publisher's results: results/<tag commit sha>.json on this branch of
+# the MIRROR (not the drop repo — only the mirror's workflow writes there).
+RESULTS_BRANCH = "results"
+RESULTS_DIR = "results"
+_SHA = re.compile(r"^[0-9a-f]{40}$")
 RULESET_NAME = "burrow-mirror-main"
 # Repository admin (Sam's own login). Granted a bypass only while the admin
 # path writes main, then removed again.
@@ -463,7 +481,8 @@ def draft(version: str, d: pathlib.Path, repo: str, target: str | None = None,
           *, verify_tag: bool = True, notes_extra: str = "") -> int:
     """Create (or complete) the DRAFT release v<version> from DIR, which
     already holds release-keys.json. With verify_tag the tag must already
-    exist (the mirror workflow: the tag IS the pushed asset commit)."""
+    exist; otherwise it is created at TARGET when the release is published
+    (the mirror workflow: target main — the upload tag is in the drop repo)."""
     tag = f"v{version}"
     names = assets(version, d)
     _require_keys(version, d)
@@ -556,7 +575,37 @@ def _git(args: list[str], *, cwd: pathlib.Path | None = None,
 
 
 def _git_url(repo: str) -> str:
+    """The MIRROR's git URL (its main: the publisher's code, read only)."""
     return os.environ.get("BURROW_MIRROR_GIT") or f"https://github.com/{repo}.git"
+
+
+def _drop_repo(repo: str) -> str:
+    """The public upload drop box next to mirror REPO (Actions disabled)."""
+    return os.environ.get("BURROW_MIRROR_DROP_REPO") or f"{repo}-drop"
+
+
+def _drop_url(repo: str) -> str:
+    """Where `push` sends tags and `scan` reads them. CI points this at
+    git@github.com:<drop>.git (its deploy key); the publisher uses the
+    public https URL, unauthenticated."""
+    return (os.environ.get("BURROW_MIRROR_DROP_GIT")
+            or f"https://github.com/{_drop_repo(repo)}.git")
+
+
+_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
+
+
+def _git_anon(args: list[str]) -> subprocess.CompletedProcess:
+    """git against the public drop repo with NO credentials: no token in the
+    environment, no credential helper, no prompt. The publisher never hands
+    the drop repo anything it could use."""
+    env = {k: v for k, v in os.environ.items() if k not in _TOKEN_VARS}
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    p = subprocess.run(["git", "-c", "credential.helper=", *args], capture_output=True,
+                       text=True, stdin=subprocess.DEVNULL, env=env)
+    if p.returncode != 0:
+        raise Refuse(f"`git {' '.join(args)}` failed: {p.stderr.strip() or p.stdout.strip()}")
+    return p
 
 
 def _public_base(repo: str) -> str:
@@ -624,13 +673,26 @@ def _api_get(path: str):
         return None
 
 
-def _mirror_status(repo: str, sha: str) -> dict | None:
-    """The publisher's latest `burrow-mirror/publish` status on commit SHA."""
-    got = _api_get(f"repos/{repo}/commits/{sha}/statuses?per_page=100")
-    if not isinstance(got, list):
+def _result_path(sha: str) -> str:
+    if not _SHA.match(sha):
+        raise Refuse(f"{sha!r} is not a commit sha")
+    return f"{RESULTS_DIR}/{sha}.json"
+
+
+def _mirror_result(repo: str, sha: str) -> dict | None:
+    """The publisher's result for drop-repo tag commit SHA, read from
+    results/<sha>.json on the MIRROR's results branch (public; no token
+    needed). None if there is none (yet)."""
+    got = _api_get(f"repos/{repo}/contents/{_result_path(sha)}?ref={RESULTS_BRANCH}")
+    if not isinstance(got, dict) or "content" not in got:
         return None
-    mine = [x for x in got if isinstance(x, dict) and x.get("context") == STATUS_CONTEXT]
-    return mine[0] if mine else None          # newest first
+    try:
+        r = json.loads(base64.b64decode(got["content"]))
+    except ValueError:
+        return None
+    if not isinstance(r, dict) or r.get("commit") != sha or r.get("context") != STATUS_CONTEXT:
+        return None
+    return r
 
 
 def _wait_for_mirror(repo: str, sha: str, ref: str) -> None:
@@ -641,7 +703,7 @@ def _wait_for_mirror(repo: str, sha: str, ref: str) -> None:
     poll = float(os.environ.get("BURROW_MIRROR_POLL", "30"))
     deadline = time.monotonic() + timeout
     while True:
-        st = _mirror_status(repo, sha)
+        st = _mirror_result(repo, sha)
         if st and st.get("state") in ("success", "failure", "error"):
             if st["state"] != "success":
                 raise Refuse(f"the mirror's publisher refused {ref}: "
@@ -692,9 +754,9 @@ def push(version: str, d: pathlib.Path, repo: str, phase: str) -> int:
         sha = _asset_commit(version, d, names, phase, work)
         # Every push is a fresh commit (new timestamp) → a new sha the
         # publisher hasn't seen, so a re-run is always re-processed.
-        _git(["push", "-q", "--force", _git_url(repo), f"HEAD:refs/tags/{ref}"], cwd=work)
-    print(f"   pushed {ref} → {sha[:12]} ({len(names)} assets); waiting for the mirror's "
-          "publisher")
+        _git(["push", "-q", "--force", _drop_url(repo), f"HEAD:refs/tags/{ref}"], cwd=work)
+    print(f"   pushed {ref} → {sha[:12]} ({len(names)} assets) to the drop repo "
+          f"{_drop_repo(repo)}; waiting for the mirror's publisher")
     # Best effort: start a publisher run now instead of at the next 5-minute
     # tick. Works with Sam's own gh login (promote_release.sh); CI's token
     # can't dispatch another repo's workflow, so CI waits for the schedule.
@@ -733,9 +795,9 @@ def _list_releases(repo: str) -> dict[str, dict]:
 
 def _release_tags(url: str) -> list[tuple[str, str, str]]:
     """[(tag, version, commit sha)] for every v<semver> / publish/v<semver>
-    tag on the mirror, oldest version first, each v<ver> before its
-    publish/v<ver>. Other tags are ignored."""
-    p = _git(["ls-remote", "--tags", url])
+    tag on the drop repo, oldest version first, each v<ver> before its
+    publish/v<ver>. Other tags are ignored. Unauthenticated."""
+    p = _git_anon(["ls-remote", "--tags", url])
     refs: dict[str, str] = {}
     for line in p.stdout.splitlines():
         sha, _, ref = line.partition("\t")
@@ -763,8 +825,8 @@ def _extract_assets(url: str, tag: str, dest: pathlib.Path, git_dir: pathlib.Pat
     at, let alone run. → the commit sha that was read."""
     if not git_dir.exists():
         _git(["init", "-q", "--bare", str(git_dir)])
-    _git(["--git-dir", str(git_dir), "fetch", "-q", "--no-tags", "--depth", "1", url,
-          f"+refs/tags/{tag}:refs/scan/x"])
+    _git_anon(["--git-dir", str(git_dir), "fetch", "-q", "--no-tags", "--depth", "1", url,
+               f"+refs/tags/{tag}:refs/scan/x"])
     sha = _git(["--git-dir", str(git_dir), "rev-parse", "refs/scan/x^{commit}"]).stdout.strip()
     top = _git(["--git-dir", str(git_dir), "ls-tree", "--name-only", "-z", sha]).stdout
     extra = sorted(n for n in top.split("\0") if n and n != ASSET_DIR)
@@ -788,16 +850,58 @@ def _extract_assets(url: str, tag: str, dest: pathlib.Path, git_dir: pathlib.Pat
     return sha
 
 
-def _set_status(repo: str, sha: str, state: str, desc: str) -> None:
+def _api_json(args: list[str], body: dict | None = None, *, check: bool = True):
+    """gh api with a JSON body (--input). → (returncode, parsed stdout or None)"""
+    f = None
+    if body is not None:
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(body, f)
+        args = [*args, "--input", f.name]
+    try:
+        p = _run(["api", *args], check=check)
+    finally:
+        if f is not None:
+            os.unlink(f.name)
+    try:
+        return p.returncode, json.loads(p.stdout) if p.stdout.strip() else None
+    except ValueError:
+        return p.returncode, None
+
+
+def _ensure_results_branch(repo: str) -> None:
+    """Create the mirror's results branch (an orphan commit holding only a
+    README: no workflow) if it doesn't exist yet."""
+    rc, _ = _api_json([f"repos/{repo}/git/ref/heads/{RESULTS_BRANCH}"], check=False)
+    if rc == 0:
+        return
+    readme = ("Results of the mirror's publisher (publish.yml on main): one "
+              "results/<tag commit sha>.json per processed upload tag of the drop repo.\n")
+    _, tree = _api_json(["-X", "POST", f"repos/{repo}/git/trees"], {"tree": [
+        {"path": "README.md", "mode": "100644", "type": "blob", "content": readme}]})
+    _, commit = _api_json(["-X", "POST", f"repos/{repo}/git/commits"],
+                          {"message": "results branch", "tree": tree["sha"], "parents": []})
+    _api_json(["-X", "POST", f"repos/{repo}/git/refs"],
+              {"ref": f"refs/heads/{RESULTS_BRANCH}", "sha": commit["sha"]})
+
+
+def _record_result(repo: str, tag: str, sha: str, state: str, desc: str) -> None:
+    """Write results/<sha>.json on the mirror's results branch with this run's
+    GITHUB_TOKEN (the drop repo's deploy key can't write the mirror)."""
+    path = _result_path(sha)
     run_url = ""
     if os.environ.get("GITHUB_RUN_ID"):
         run_url = (f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}"
                    f"/actions/runs/{os.environ['GITHUB_RUN_ID']}")
-    args = ["api", "-X", "POST", f"repos/{repo}/statuses/{sha}", "-f", f"state={state}",
-            "-f", f"context={STATUS_CONTEXT}", "-f", f"description={desc[:139]}"]
-    if run_url:
-        args += ["-f", f"target_url={run_url}"]
-    _run(args)
+    doc = {"context": STATUS_CONTEXT, "drop": _drop_repo(repo), "tag": tag, "commit": sha,
+           "state": state, "description": desc[:1000], "target_url": run_url}
+    _ensure_results_branch(repo)
+    body = {"message": f"{tag} {sha[:12]}: {state}", "branch": RESULTS_BRANCH,
+            "content": base64.b64encode((json.dumps(doc, indent=2, sort_keys=True)
+                                         + "\n").encode()).decode()}
+    rc, cur = _api_json([f"repos/{repo}/contents/{path}?ref={RESULTS_BRANCH}"], check=False)
+    if rc == 0 and isinstance(cur, dict) and "sha" in cur:
+        body["sha"] = cur["sha"]
+    _api_json(["-X", "PUT", f"repos/{repo}/contents/{path}"], body)
 
 
 def _note_processed(repo: str, tag: str, sha: str) -> None:
@@ -816,12 +920,13 @@ def scan(repo: str, keys_path: pathlib.Path) -> int:
     (publish.yml on schedule / workflow_dispatch). For each release tag
     commit not processed yet: read its assets as data, verify_release
     against the key table on main, then draft (v<ver>) or publish
-    (publish/v<ver>), and record the outcome as a commit status."""
+    (publish/v<ver>), and record the outcome in the mirror's results
+    branch. Tags come from the drop repo; nothing but assets/* is read."""
     try:
         table = parse_table(keys_path.read_bytes())
     except OSError as e:
         raise Refuse(f"{keys_path}: can't read the key table ({e})") from None
-    url = _git_url(repo)
+    url = _drop_url(repo)
     rels = _list_releases(repo)
     refused = 0
     with tempfile.TemporaryDirectory() as tmp:
@@ -831,7 +936,10 @@ def scan(repo: str, keys_path: pathlib.Path) -> int:
             rel = rels.get(rel_tag)
             if rel is not None and _marker(sha) in (rel.get("body") or ""):
                 continue
-            if rel is None and _mirror_status(repo, sha):
+            if not _SHA.match(sha):
+                print(f"   ignoring tag {tag!r} (not a sha-1 commit)")
+                continue
+            if rel is None and _mirror_result(repo, sha):
                 continue                       # refused before any release existed
             d = pathlib.Path(tmp) / f"t{i}"
             try:
@@ -840,14 +948,17 @@ def scan(repo: str, keys_path: pathlib.Path) -> int:
                 if tag.startswith(PUBLISH_TAG_PREFIX):
                     finalize(version, d, repo)
                 else:
-                    draft(version, d, repo, verify_tag=True, notes_extra=notes)
-                _set_status(repo, sha, "success", f"{tag}: done")
+                    # The tag lives in the drop repo; the mirror's own tag
+                    # v<ver> is made by GitHub on publish, at mirror main.
+                    draft(version, d, repo, target="main", verify_tag=False,
+                          notes_extra=f"{notes}\n\nUploaded as {_drop_repo(repo)}@{sha}.")
+                _record_result(repo, tag, sha, "success", f"{tag}: done")
                 print(f"✓ {tag} ({sha[:12]})")
             except Refuse as e:
                 refused += 1
                 print(f"✗ {tag} ({sha[:12]}): {e}", file=sys.stderr)
                 try:
-                    _set_status(repo, sha, "failure", f"{tag}: {e}")
+                    _record_result(repo, tag, sha, "failure", f"{tag}: {e}")
                 except Refuse as e2:            # e.g. a tag that isn't a commit
                     print(f"   (couldn't record the refusal: {e2})", file=sys.stderr)
             _note_processed(repo, rel_tag, sha)
@@ -902,6 +1013,47 @@ def protect_mirror(repo: str) -> int:
     if rs is None or not _locked(rs):
         raise Refuse(f"ruleset {RULESET_NAME} on {repo} isn't in force")
     print(f"✓ {repo} main protected by ruleset {rs['id']} ({RULESET_NAME})")
+    return 0
+
+
+def check_setup(repo: str) -> int:
+    """Verify the mirror's trust setup (read-only): the drop repo is public
+    with Actions DISABLED and exactly one write deploy key (CI's); the mirror
+    has NO deploy key; the ruleset protecting mirror main is in force."""
+    drop = _drop_repo(repo)
+    bad: list[str] = []
+
+    def get(path):
+        rc, got = _api_json([path], check=False)
+        return got if rc == 0 else None
+
+    info = get(f"repos/{drop}")
+    if not isinstance(info, dict) or info.get("private") is not False:
+        bad.append(f"drop repo {drop} isn't a public repo")
+    perms = get(f"repos/{drop}/actions/permissions")
+    if not isinstance(perms, dict) or perms.get("enabled") is not False:
+        bad.append(f"GitHub Actions is NOT disabled on {drop} (actions/permissions "
+                   f"enabled={None if not isinstance(perms, dict) else perms.get('enabled')})")
+    keys = get(f"repos/{drop}/keys")
+    if not isinstance(keys, list) or len(keys) != 1 or keys[0].get("read_only") is not False:
+        bad.append(f"{drop} should have exactly one write deploy key (CI's), has "
+                   f"{keys if not isinstance(keys, list) else len(keys)}")
+    mkeys = get(f"repos/{repo}/keys")
+    if mkeys != []:
+        bad.append(f"the mirror {repo} must have NO deploy keys, has "
+                   f"{mkeys if not isinstance(mkeys, list) else len(mkeys)}")
+    try:
+        rs = _find_ruleset(repo)
+    except Refuse as e:
+        rs, bad = None, bad + [str(e)]
+    if rs is None or not _locked(rs):
+        bad.append(f"ruleset {RULESET_NAME} on {repo} isn't in force with no bypass")
+    for b in bad:
+        print(f"✗ {b}", file=sys.stderr)
+    if bad:
+        return 1
+    print(f"✓ {drop}: public, Actions disabled, one write deploy key; {repo}: no deploy "
+          f"keys, main locked by ruleset {rs['id']}")
     return 0
 
 
@@ -1034,6 +1186,8 @@ def main(argv: list[str]) -> int:
             return update_publisher(repo)
         if argv == ["protect-mirror"]:
             return protect_mirror(repo)
+        if argv == ["check-setup"]:
+            return check_setup(repo)
         if len(argv) == 3 and argv[0] == "draft":
             return draft(argv[1], pathlib.Path(argv[2]), repo, target)
         if len(argv) == 3 and argv[0] == "publish":
