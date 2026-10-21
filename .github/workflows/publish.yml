@@ -1,0 +1,41 @@
+# Mirror repo syu16688/burrowai-dev-releases: turn a pushed release tag into
+# a GitHub Release. Canonical copy: burrowai-dev scripts/mirror/publish.yml;
+# every release commit carries it (scripts/github_release.py push), so the
+# copy on this repo's main is for reading.
+#
+#   tag v<version>          → draft: create/complete the DRAFT release from
+#                             assets/ in the tag (a draft's differing assets
+#                             are replaced; a PUBLISHED release with different
+#                             bytes is refused)
+#   tag publish/v<version>  → finalize: re-download every draft asset,
+#                             require identical bytes, then publish
+#
+# Pushed by burrowai-dev's Release CI (write deploy key) and by
+# promote_release.sh for signed releases. Nothing secret lives here: the only
+# credential is this run's own GITHUB_TOKEN.
+name: publish
+
+on:
+  push:
+    tags: ['v*', 'publish/v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-publish
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Draft or publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ github.ref_name }}
+        run: python3 .github/mirror/github_release.py workflow "$REF" assets --repo "$GITHUB_REPOSITORY"
