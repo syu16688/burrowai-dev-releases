@@ -1,0 +1,9 @@
+{
+  "commit": "3275be1fa0fbd97eb3a46209b9fcc1d734b1c1d2",
+  "context": "burrow-mirror/publish",
+  "description": "publish/v0.1.199: done",
+  "drop": "syu16688/burrowai-dev-releases-drop",
+  "state": "success",
+  "tag": "publish/v0.1.199",
+  "target_url": "https://github.com/syu16688/burrowai-dev-releases/actions/runs/43534390523"
+}
